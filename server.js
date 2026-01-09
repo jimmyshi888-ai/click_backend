@@ -11,11 +11,7 @@ const app = express();
 const PORT = 3000;
 
 // 2. 安全性與 Middleware
-app.use(cors({
-  origin: 'http://localhost:5173', // 允許 Vite 前端連線
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type']
-}));
+app.use(cors()); 
 app.use(express.json());
 
 // 3. 資料庫連線 (Google Sheets)
