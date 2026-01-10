@@ -293,73 +293,85 @@ app.post('/api/update-score', async (req, res) => {
  * POST /api/gacha
  * 功能：轉蛋 (扣除金幣 -> 隨機取得物品 -> 存入背包)
  */
+
 /**
  * POST /api/gacha
- * 功能：轉蛋 (權重版：SSR 最容易，N 最難)
+ * 功能：轉蛋 (防空行 + 權重機率版)
  */
 app.post('/api/gacha', async (req, res) => {
-  const { userId } = req.body;
-  const COST = 100; 
+  const { userId, count = 1 } = req.body; // 支援次數，預設為 1
+  const PRICE_PER_PULL = 100;
+  const totalCost = PRICE_PER_PULL * count;
 
   try {
+    // 1. 取得使用者資料
     const rows = await getUsers();
-    const rowIndex = rows.findIndex(row => row[0] === userId);
+    
+    // ★ 修正 1：尋找玩家時，必須確保該行存在 row 且有 ID (row[0])，跳過空洞
+    const rowIndex = rows.findIndex(row => row && row[0] === userId);
 
-    if (rowIndex === -1) return res.status(404).json({ error: '找不到使用者' });
+    if (rowIndex === -1) return res.status(404).json({ error: '找不到使用者，請重新登入' });
 
-    // 1. 檢查餘額
+    // 2. 檢查餘額 (金幣在 E 欄，索引為 4)
     const currentCoins = parseInt(rows[rowIndex][4] || 0);
-    if (currentCoins < COST) {
-      return res.status(400).json({ error: '金幣不足！需要 100 金幣' });
+    if (currentCoins < totalCost) {
+      return res.status(400).json({ error: `金幣不足！需要 ${totalCost} 金幣` });
     }
 
-    // 2. 讀取獎品池
+    // 3. 讀取獎品池
     const allItems = await getItems();
-    if (allItems.length === 0) return res.status(500).json({ error: '獎池是空的' });
+    // ★ 修正 2：過濾掉 items 表格中的無效行 (確保有 ID 和稀有度)
+    const validItems = allItems.filter(item => item && item.id && item.rarity);
 
-    // --- ★★★ 修改開始：權重隨機演算法 ★★★ ---
-    
-    // 定義每個等級的「份額」(數字越大越容易抽到)
-    // 你想要 SSR 最容易，N 最難，所以 SSR 給最大
+    if (validItems.length === 0) return res.status(500).json({ error: '獎池是空的，請管理員檢查 items 表' });
+
+    // --- 權重設定 ---
     const rarityWeights = {
       'UR':  0.1,
-      'SSR': 0.9, // 0.9% 機率 - 超級難抽！
-      'SR':  9, // 9% 機率
-      'R':   30,  // 30% 機率
-      'N':   60,
-      
+      'SSR': 0.9, 
+      'SR':  9, 
+      'R':   30,  
+      'N':   60
     };
 
-    // 計算總權重 (Total Weight)
+    // 計算總權重
     let totalWeight = 0;
-    const pool = allItems.map(item => {
-      // 取得該物品的權重，如果沒寫等級預設給 1
-      // 這裡會把 Google Sheet 的 "SSR" 對應到上面的 60
+    const pool = validItems.map(item => {
       const weight = rarityWeights[item.rarity] || 1;
       totalWeight += weight;
-      return { ...item, weight }; // 把權重綁定到物品上
+      return { ...item, weight };
     });
 
-    // 產生一個 0 到 總權重 之間的隨機數字
-    let randomNum = Math.random() * totalWeight;
-    let randomItem = null;
+    // --- 執行抽獎迴圈 ---
+    const obtainedItems = [];
+    const newInventoryRows = [];
+    const timestamp = new Date().toISOString();
 
-    // 像輪盤一樣，看指針停在哪個區間
-    for (const item of pool) {
-      randomNum -= item.weight;
-      if (randomNum < 0) {
-        randomItem = item;
-        break;
+    for (let i = 0; i < count; i++) {
+      let randomNum = Math.random() * totalWeight;
+      let selectedItem = pool[0];
+
+      for (const item of pool) {
+        randomNum -= item.weight;
+        if (randomNum < 0) {
+          selectedItem = item;
+          break;
+        }
       }
+      obtainedItems.push(selectedItem);
+      
+      // 準備寫入背包的資料
+      newInventoryRows.push([
+        uuidv4(),
+        userId,
+        selectedItem.id,
+        timestamp
+      ]);
     }
-    
-    // 防呆：萬一算錯沒抓到，就預設給第一個
-    if (!randomItem) randomItem = pool[0];
 
-    // --- ★★★ 修改結束 ★★★ ---
-
-    // 3. 執行交易
-    const newCoins = currentCoins - COST;
+    // 4. 執行資料庫更新
+    // 4-1. 扣錢 (使用原本找到的正確 rowIndex + 1)
+    const newCoins = currentCoins - totalCost;
     const sheetRowNumber = rowIndex + 1;
     
     await sheets.spreadsheets.values.update({
@@ -369,29 +381,25 @@ app.post('/api/gacha', async (req, res) => {
       resource: { values: [[newCoins]] }
     });
 
-    const newInvRow = [
-      uuidv4(),
-      userId,
-      randomItem.id,
-      new Date().toISOString()
-    ];
-    
+    // 4-2. 批次寫入背包 (inventory)
     await sheets.spreadsheets.values.append({
       spreadsheetId: SPREADSHEET_ID,
       range: 'inventory!A:D',
       valueInputOption: 'USER_ENTERED',
-      resource: { values: [newInvRow] },
+      resource: { values: newInventoryRows },
     });
 
+    // 回傳結果 (相容單抽與十連抽)
     res.json({ 
       success: true, 
-      item: randomItem, 
+      item: obtainedItems[0], // 舊前端習慣讀單個
+      items: obtainedItems,   // 新前端讀陣列
       newCoins: newCoins 
     });
 
   } catch (error) {
     console.error('轉蛋失敗:', error);
-    res.status(500).json({ error: '轉蛋機故障了，請稍後再試' });
+    res.status(500).json({ error: '轉蛋機故障，可能是資料庫格式有誤' });
   }
 });
 
@@ -400,14 +408,10 @@ app.post('/api/gacha', async (req, res) => {
  * 功能：物品合成 (3個低階 -> 1個高階)
  * 規則：N->R, R->SR, SR->SSR (UR不能合成)
  */
-/**
- * POST /api/synthesize
- * 功能：指定物品合成 (接收 3 個 inventory_id -> 產出 1 個高階)
- */
+
 app.post('/api/synthesize', async (req, res) => {
   const { userId, materialIds } = req.body;
 
-  // 檢查是否選了 3 張
   if (!materialIds || materialIds.length !== 3) {
     return res.status(400).json({ error: '合成需要選擇 3 張卡片' });
   }
@@ -424,10 +428,11 @@ app.post('/api/synthesize', async (req, res) => {
     let sourceRarity = null;
 
     for (const targetInvId of materialIds) {
-      const rowIndex = invRows.findIndex(row => row[0] === targetInvId);
+      // ★ 修正 1：尋找索引時，確保 row 存在且不是空行 (避免讀到洞)
+      const rowIndex = invRows.findIndex(row => row && row[0] === targetInvId);
       
       if (rowIndex === -1) {
-        return res.status(404).json({ error: '找不到指定的卡片' });
+        return res.status(404).json({ error: '找不到指定的卡片，可能已被消耗' });
       }
 
       const row = invRows[rowIndex];
@@ -435,25 +440,26 @@ app.post('/api/synthesize', async (req, res) => {
         return res.status(403).json({ error: '你沒有這張卡片的權限' });
       }
 
-      // ★ 關鍵邏輯：這裡是檢查「稀有度 (Rarity)」是否一致
-      // 只要稀有度一樣 (例如都是 N)，不管卡片名字是不是一樣，都可以合成！
       const item = allItems.find(it => it.id === row[2]);
       
+      if (!item) {
+        return res.status(404).json({ error: '找不到物品詳細資料' });
+      }
+
       if (!sourceRarity) sourceRarity = item.rarity;
       
       if (item.rarity !== sourceRarity) {
-        return res.status(400).json({ error: '所有素材必須是「相同稀有度」' });
+        return res.status(400).json({ error: '所有素材必須是相同稀有度' });
       }
 
       rowsToDelete.push(rowIndex + 1);
     }
 
-    // 3. 決定目標稀有度
     const upgradeMap = { 'N': 'R', 'R': 'SR', 'SR': 'SSR' };
     const targetRarity = upgradeMap[sourceRarity];
     if (!targetRarity) return res.status(400).json({ error: '此稀有度無法再升級' });
 
-    // 4. 執行刪除 (從後面往前刪，避免索引跑掉)
+    // 執行清空
     rowsToDelete.sort((a, b) => b - a);
     for (const rowNum of rowsToDelete) {
       await sheets.spreadsheets.values.clear({
@@ -462,11 +468,9 @@ app.post('/api/synthesize', async (req, res) => {
       });
     }
 
-    // 5. 隨機產生新物品
     const targetItems = allItems.filter(item => item.rarity === targetRarity);
     const newItem = targetItems[Math.floor(Math.random() * targetItems.length)];
 
-    // 6. 寫入新物品
     const newInvRow = [uuidv4(), userId, newItem.id, new Date().toISOString()];
     await sheets.spreadsheets.values.append({
       spreadsheetId: SPREADSHEET_ID,
@@ -475,11 +479,7 @@ app.post('/api/synthesize', async (req, res) => {
       resource: { values: [newInvRow] },
     });
 
-    res.json({
-      success: true,
-      newItem: newItem,
-      message: '合成成功！'
-    });
+    res.json({ success: true, newItem: newItem, message: '合成成功！' });
 
   } catch (error) {
     console.error('合成失敗:', error);
@@ -520,21 +520,17 @@ app.get('/api/leaderboard', async (req, res) => {
   }
 });
 
+
 /**
  * POST /api/claim-global-reward
- * 功能：領取全服獎勵 (神秘大獎)
- */
-/**
- * POST /api/claim-global-reward
- * 功能：領取全服里程碑獎勵 (支援金幣與物品)
+ * 功能：領取全服里程碑獎勵 (防空行強化版)
  */
 app.post('/api/claim-global-reward', async (req, res) => {
-  const { userId, target } = req.body; // target: 2000, 2500, or 3000
+  const { userId, target } = req.body;
 
-  // 定義獎勵設定
   const rewards = {
     2000: { type: 'coin', value: 1000, recordId: 'REWARD_2000' },
-    2500: { type: 'item', value: '501', recordId: '501' }, // 501 是新年快樂卡
+    2500: { type: 'item', value: '501', recordId: '501' },
     3000: { type: 'coin', value: 3000, recordId: 'REWARD_3000' }
   };
 
@@ -542,23 +538,30 @@ app.post('/api/claim-global-reward', async (req, res) => {
   if (!reward) return res.status(400).json({ error: '無效的獎勵目標' });
 
   try {
-    const rows = await getUsers();
+    const rows = await getUsers(); // 取得 users 表
     
-    // 1. 檢查全服進度
-    const globalTotal = rows.slice(1).reduce((sum, row) => sum + parseInt(row[5] || 0), 0);
+    // ★ 修正 1：過濾無效行，並計算全服總點擊
+    // 確保 row 存在且 row[5] (total_clicks) 有數值，避免 parseInt 出現 NaN
+    const globalTotal = rows.slice(1).reduce((sum, row) => {
+      if (row && row[5]) {
+        return sum + (parseInt(row[5]) || 0);
+      }
+      return sum;
+    }, 0);
+
     if (globalTotal < target) {
-      return res.status(400).json({ error: `全服目標 ${target} 尚未達成！` });
+      return res.status(400).json({ error: `全服目標 ${target} 尚未達成！目前：${globalTotal}` });
     }
 
-    // 2. 檢查是否領過 (查背包紀錄)
+    // 取得背包資料
     const invResponse = await sheets.spreadsheets.values.get({
       spreadsheetId: SPREADSHEET_ID,
       range: 'inventory!A:D',
     });
     const invRows = invResponse.data.values || [];
     
-    // 檢查是否有 recordId (不管是物品還是金幣紀錄)
-    const hasClaimed = invRows.some(row => row[1] === userId && row[2] === reward.recordId);
+    // ★ 修正 2：檢查是否領過時，也要跳過空行
+    const hasClaimed = invRows.some(row => row && row[1] === userId && row[2] === reward.recordId);
 
     if (hasClaimed) {
       return res.status(400).json({ error: '你已經領過這個獎勵囉！' });
@@ -566,15 +569,14 @@ app.post('/api/claim-global-reward', async (req, res) => {
 
     // 3. 發放獎勵
     if (reward.type === 'coin') {
-      // --- 發金幣 ---
-      const userIndex = rows.findIndex(row => row[0] === userId);
+      // ★ 修正 3：尋找使用者索引時，跳過空行
+      const userIndex = rows.findIndex(row => row && row[0] === userId);
       if (userIndex === -1) return res.status(404).json({ error: '找不到使用者' });
       
       const currentCoins = parseInt(rows[userIndex][4] || 0);
       const newCoins = currentCoins + reward.value;
       const sheetRow = userIndex + 1;
 
-      // 更新金幣
       await sheets.spreadsheets.values.update({
         spreadsheetId: SPREADSHEET_ID,
         range: `users!E${sheetRow}`,
@@ -583,11 +585,11 @@ app.post('/api/claim-global-reward', async (req, res) => {
       });
     } 
     
-    // 4. 寫入領取紀錄 (如果是物品，這就是發物品；如果是金幣，這就是防重複領取的紀錄)
+    // 4. 寫入領取紀錄
     const newInvRow = [
       uuidv4(),
       userId,
-      reward.recordId, // 存入 501 或 REWARD_2000
+      reward.recordId,
       new Date().toISOString()
     ];
     
@@ -606,7 +608,7 @@ app.post('/api/claim-global-reward', async (req, res) => {
 
   } catch (error) {
     console.error('領獎失敗:', error);
-    res.status(500).json({ error: '領取失敗，請稍後再試' });
+    res.status(500).json({ error: '領取失敗，伺服器讀取錯誤' });
   }
 });
 // 啟動伺服器
@@ -639,14 +641,10 @@ async function getItems() {
   }
 }
 
-/**
+
  * GET /api/inventory/:userId
  * 功能：取得某位玩家的背包內容
- */
-/**
- * GET /api/inventory/:userId
- * 功能：取得某位玩家的背包內容
- */
+ */// 修改後的 /api/inventory/:userId
 app.get('/api/inventory/:userId', async (req, res) => {
   const { userId } = req.params;
 
@@ -656,7 +654,12 @@ app.get('/api/inventory/:userId', async (req, res) => {
       range: 'inventory!A:D',
     });
     const invRows = invResponse.data.values || [];
-    const userInventory = invRows.slice(1).filter(row => row[1] === userId);
+
+    // ★ 關鍵修改：過濾掉空行 (檢查 row[0] 是否存在)
+    const validRows = invRows.slice(1).filter(row => row && row[0] && row[1]);
+    
+    // 篩選該玩家的物品
+    const userInventory = validRows.filter(row => row[1] === userId);
 
     if (userInventory.length === 0) {
       return res.json({ items: [] });
@@ -665,22 +668,20 @@ app.get('/api/inventory/:userId', async (req, res) => {
     const allItems = await getItems();
 
     const result = userInventory.map(invRow => {
-      const itemId = invRow[2]; // 這是背包紀錄的 item_id (例如 REWARD_2000)
+      const itemId = invRow[2];
       const itemDetail = allItems.find(item => item.id === itemId);
-      
-      // ★ 修改這裡：無論有沒有查到 itemDetail，都要回傳 id
       return {
         inventory_id: invRow[0],
         obtained_at: invRow[3],
-        id: itemId, // ★ 強制回傳 ID，這樣前端才能判斷是否領過
-        ...itemDetail // 如果有詳細資料就展開，沒有就算了
+        id: itemId,
+        ...itemDetail
       };
     });
 
     res.json({ items: result });
 
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: '讀取背包失敗' });
+    console.error('讀取背包失敗:', error);
+    res.status(500).json({ error: '伺服器內部錯誤' });
   }
 });
