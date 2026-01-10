@@ -642,9 +642,8 @@ async function getItems() {
 }
 
 
- * GET /api/inventory/:userId
- * 功能：取得某位玩家的背包內容
- */// 修改後的 /api/inventory/:userId
+// GET /api/inventory/:userId
+// 功能：取得某位玩家的背包內容
 app.get('/api/inventory/:userId', async (req, res) => {
   const { userId } = req.params;
 
