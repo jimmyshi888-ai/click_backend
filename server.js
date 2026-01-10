@@ -156,6 +156,32 @@ app.post('/api/gacha', async (req, res) => {
   }
 });
 
+// --- 1. 註冊 API ---
+app.post('/api/register', async (req, res) => {
+  const { username, email, password } = req.body;
+  if (!username || !email || !password) return res.status(400).json({ error: '請填寫完整' });
+
+  try {
+    const rows = await getUsers();
+    const emailExists = rows.slice(1).some(row => row[2] === email);
+    if (emailExists) return res.status(409).json({ error: '此 Email 已經註冊過' });
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const newUserId = uuidv4();
+    const newRow = [newUserId, username, email, hashedPassword, 0, 0, new Date().toISOString()];
+
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'users!A:G',
+      valueInputOption: 'USER_ENTERED',
+      resource: { values: [newRow] },
+    });
+    res.status(201).json({ message: '註冊成功' });
+  } catch (error) {
+    res.status(500).json({ error: '伺服器錯誤' });
+  }
+});
+
 /**
  * POST /api/login
  * 功能：使用者登入
